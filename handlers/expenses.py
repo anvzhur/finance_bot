@@ -10,8 +10,8 @@ from keyboards import (
     get_confirmation_keyboard,
     get_organisation_keyboard
 )
-from handlers.start import MAIN_MENU as main_menu
-from database import get_user_api_key
+from handlers.start import get_main_menu
+from database import get_user_info, log_simple_operation
 import datetime
 import uuid
 
@@ -26,80 +26,36 @@ class OperationForm(StatesGroup):
     entering_purpose = State()
     confirming = State()
 
-
-# --- Выбор типа операции ---
 @router.message(F.text == "➕ Добавить расход")
 async def add_expense_start(message: Message, state: FSMContext):
-    api_key = await get_user_api_key(message.from_user.id)
-    if not api_key:
+    user_info = await get_user_info(message.from_user.id)
+    if not user_info or not user_info.get("api_key"):
         await message.answer("❌ Вы не зарегистрированы. Обратитесь к администратору.")
         return
-    await state.update_data(operation_type="expense", direction_id=510, api_key=api_key)
+    await state.update_data(
+        operation_type="expense",
+        direction_id=510,
+        api_key=user_info["api_key"]
+    )
     await _start_operation_flow(message, state)
-
 
 @router.message(F.text == "➕ Добавить приход")
 async def add_income_start(message: Message, state: FSMContext):
-    api_key = await get_user_api_key(message.from_user.id)
-    if not api_key:
+    user_info = await get_user_info(message.from_user.id)
+    if not user_info or not user_info.get("api_key"):
         await message.answer("❌ Вы не зарегистрированы. Обратитесь к администратору.")
         return
-    await state.update_data(operation_type="income", direction_id=500, api_key=api_key)
+    await state.update_data(
+        operation_type="income",
+        direction_id=500,
+        api_key=user_info["api_key"]
+    )
     await _start_operation_flow(message, state)
 
-
-async def _start_operation_flow(message: Message, state: FSMContext):
+async def _proceed_to_organisation(message: Message, state: FSMContext):
     data = await state.get_data()
     api_key = data.get("api_key")
-    if not api_key:
-        await message.answer("❌ Ошибка: API-ключ не найден.")
-        await state.clear()
-        return
-
     api = ReportFinanceAPI(api_key=api_key)
-    try:
-        projects = await api.fetch_all_projects()
-        if not projects:
-            await message.answer("Нет доступных проектов.")
-            return
-        project_map = {p["projectName"]: p["id"] for p in projects}
-        await state.update_data(projects=project_map, projects_full=projects)
-        await message.answer("Выберите проект:", reply_markup=get_project_keyboard(projects))
-        await state.set_state(OperationForm.choosing_project)
-    except Exception as e:
-        await message.answer(f"❌ Ошибка загрузки проектов: {e}")
-
-
-# --- Выбор проекта ---
-@router.message(OperationForm.choosing_project)
-async def process_project_choice(message: Message, state: FSMContext):
-    user_data = await state.get_data()
-    project_name = message.text
-    project_id = user_data["projects"].get(project_name)
-    if project_id is None:
-        await message.answer("Неверный выбор. Выберите проект из списка.")
-        return
-
-    projects_full = user_data.get("projects_full")
-    if not projects_full:
-        await message.answer("Ошибка: данные о проектах утеряны.")
-        await state.clear()
-        return
-
-    selected_project = next((p for p in projects_full if p["id"] == project_id), None)
-    if not selected_project:
-        await message.answer("Ошибка: проект не найден.")
-        await state.clear()
-        return
-
-    await state.update_data(
-        project_id=project_id,
-        project_name=project_name
-    )
-
-    api_key = user_data["api_key"]
-    api = ReportFinanceAPI(api_key=api_key)
-
     try:
         organisations = await api.fetch_all_organisations()
         if not organisations:
@@ -114,8 +70,46 @@ async def process_project_choice(message: Message, state: FSMContext):
         await message.answer(f"❌ Ошибка загрузки организаций: {e}")
         await state.clear()
 
+async def _start_operation_flow(message: Message, state: FSMContext):
+    data = await state.get_data()
+    api_key = data.get("api_key")
+    if not api_key:
+        await message.answer("❌ Ошибка: API-ключ не найден.")
+        await state.clear()
+        return
+    api = ReportFinanceAPI(api_key=api_key)
+    try:
+        projects = await api.fetch_all_projects()
+        project_map = {"Без проекта": None}
+        projects_with_placeholder = [{"projectName": "Без проекта", "id": None}]
+        if projects:
+            project_map.update({p["projectName"]: p["id"] for p in projects})
+            projects_with_placeholder.extend(projects)
+        await state.update_data(
+            projects=project_map,
+            projects_full=projects_with_placeholder
+        )
+        if not projects:
+            await state.update_data(project_id=None, project_name="Без проекта")
+            await _proceed_to_organisation(message, state)
+        else:
+            await message.answer("Выберите проект:", reply_markup=get_project_keyboard(projects_with_placeholder))
+            await state.set_state(OperationForm.choosing_project)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка загрузки проектов: {e}")
+        await state.clear()
 
-# --- Выбор организации ---
+@router.message(OperationForm.choosing_project)
+async def process_project_choice(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    project_name = message.text
+    project_id = user_data["projects"].get(project_name)
+    if project_id is None and project_name != "Без проекта":
+        await message.answer("Неверный выбор. Выберите проект из списка.")
+        return
+    await state.update_data(project_id=project_id, project_name=project_name)
+    await _proceed_to_organisation(message, state)
+
 @router.message(OperationForm.choosing_organisation)
 async def process_organisation_choice(message: Message, state: FSMContext):
     user_data = await state.get_data()
@@ -124,12 +118,9 @@ async def process_organisation_choice(message: Message, state: FSMContext):
     if organisation_id is None:
         await message.answer("Неверный выбор. Выберите организацию из списка.")
         return
-
     await state.update_data(organisation_id=organisation_id, organisation_name=org_name)
-
     api_key = user_data["api_key"]
     api = ReportFinanceAPI(api_key=api_key)
-
     try:
         accounts = await api.fetch_all_accounts()
         if not accounts:
@@ -147,8 +138,6 @@ async def process_organisation_choice(message: Message, state: FSMContext):
         await message.answer(f"❌ Ошибка загрузки счетов: {e}")
         await state.clear()
 
-
-# --- Выбор счёта ---
 @router.message(OperationForm.choosing_account)
 async def process_account_choice(message: Message, state: FSMContext):
     user_data = await state.get_data()
@@ -157,7 +146,6 @@ async def process_account_choice(message: Message, state: FSMContext):
     if account_id is None:
         await message.answer("Неверный выбор. Выберите счёт из списка.")
         return
-
     account_name = next(
         (a["accountName"] for a in user_data["accounts_full"] if a["id"] == account_id),
         account_key
@@ -166,8 +154,6 @@ async def process_account_choice(message: Message, state: FSMContext):
     await message.answer("Введите сумму (в рублях):")
     await state.set_state(OperationForm.entering_amount)
 
-
-# --- Ввод суммы ---
 @router.message(OperationForm.entering_amount)
 async def process_amount(message: Message, state: FSMContext):
     try:
@@ -180,8 +166,6 @@ async def process_amount(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("Введите корректную положительную сумму.")
 
-
-# --- Ввод назначения ---
 @router.message(OperationForm.entering_purpose)
 async def process_purpose(message: Message, state: FSMContext):
     await state.update_data(purpose=message.text)
@@ -199,34 +183,29 @@ async def process_purpose(message: Message, state: FSMContext):
     )
     await state.set_state(OperationForm.confirming)
 
-
-# --- Подтверждение ---
 @router.message(OperationForm.confirming)
 async def confirm_operation(message: Message, state: FSMContext):
     if message.text not in ("✅ Да", "❌ Нет"):
         await message.answer("Пожалуйста, используйте кнопки для подтверждения.")
         return
-
     if message.text == "❌ Нет":
         await state.clear()
-        await message.answer("Операция отменена.", reply_markup=main_menu)
+        await message.answer("Операция отменена.", reply_markup=get_main_menu())
         return
-
     data = await state.get_data()
-    api_key = data.get("api_key")
-    if not api_key:
-        await message.answer("❌ Ошибка: API-ключ не найден. Операция отменена.", reply_markup=main_menu)
+    user_info = await get_user_info(message.from_user.id)
+    if not user_info or not user_info.get("api_key"):
+        await message.answer("❌ Ошибка: API-ключ не найден.", reply_markup=get_main_menu())
         await state.clear()
         return
-
-    api = ReportFinanceAPI(api_key=api_key)
+    api = ReportFinanceAPI(api_key=user_info["api_key"])
     direction_id = data["direction_id"]
+    operation_date = datetime.date.today()
     payment_data = {
         "externalId": str(uuid.uuid4()),
         "accountId": data["account_id"],
-        "projectId": data["project_id"],
         "organisationId": data["organisation_id"],
-        "paymentDate": datetime.date.today().isoformat(),
+        "paymentDate": operation_date.isoformat(),
         "sourcePaymentSum": data["amount"],
         "paymentSum": 0,
         "sourceCurrencyId": "RUB",
@@ -237,12 +216,18 @@ async def confirm_operation(message: Message, state: FSMContext):
         "paymentStatusId": 529,
         "priorityId": 532,
     }
-
+    if data.get("project_id") is not None:
+        payment_data["projectId"] = data["project_id"]
     try:
         await api.create_payment(payment_data)
+        await log_simple_operation(
+            telegram_id=message.from_user.id,
+            operation_type="expense" if direction_id == 510 else "income",
+            operation_date=operation_date
+        )
         word = "расход" if direction_id == 510 else "приход"
-        await message.answer(f"✅ {word.capitalize()} успешно добавлен!", reply_markup=main_menu)
+        await message.answer(f"✅ {word.capitalize()} успешно добавлен!", reply_markup=get_main_menu())
     except Exception as e:
-        await message.answer(f"❌ Ошибка при отправке: {e}", reply_markup=main_menu)
+        await message.answer(f"❌ Ошибка при отправке: {e}", reply_markup=get_main_menu())
     finally:
         await state.clear()

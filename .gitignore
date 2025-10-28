@@ -22,3 +22,5 @@ env/
 
 # Local configuration (если будете добавлять)
 config_local.py
+
+project_combined.txt

@@ -2,6 +2,7 @@
 import aiohttp
 from config import BASE_URL, HEADERS
 from typing import List, Dict, Any
+import datetime
 
 class ReportFinanceAPI:
     def __init__(self, api_key: str):
@@ -31,12 +32,18 @@ class ReportFinanceAPI:
         all_projects = []
         offset = 0
         limit = 100
+        today = datetime.date.today()
         while True:
             data = await self.get_projects(offset=offset, limit=limit)
-            projects = data.get("listProject", [])
-            all_projects.extend(projects)
+            raw_projects = data.get("listProject", [])
+            # Фильтруем только активные проекты (endDate >= сегодня)
+            active_projects = [
+                p for p in raw_projects
+                if p.get("endDate") and datetime.date.fromisoformat(p["endDate"].split("T")[0]) >= today
+            ]
+            all_projects.extend(active_projects)
             total = data.get("totalLineCount", 0)
-            if not projects or offset + limit >= total:
+            if not raw_projects or offset + limit >= total:
                 break
             offset += limit
         return all_projects
