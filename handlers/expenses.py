@@ -77,6 +77,7 @@ async def _start_operation_flow(message: Message, state: FSMContext):
         await message.answer("❌ Ошибка: API-ключ не найден.")
         await state.clear()
         return
+
     api = ReportFinanceAPI(api_key=api_key)
     try:
         projects = await api.fetch_all_projects()
@@ -118,21 +119,29 @@ async def process_organisation_choice(message: Message, state: FSMContext):
     if organisation_id is None:
         await message.answer("Неверный выбор. Выберите организацию из списка.")
         return
+
     await state.update_data(organisation_id=organisation_id, organisation_name=org_name)
     api_key = user_data["api_key"]
     api = ReportFinanceAPI(api_key=api_key)
+
     try:
-        accounts = await api.fetch_all_accounts()
-        if not accounts:
-            await message.answer("Нет доступных банковских счетов.")
+        all_accounts = await api.fetch_all_accounts()
+        # Фильтруем только счета, принадлежащие выбранной организации
+        filtered_accounts = [
+            acc for acc in all_accounts
+            if acc.get("organisationId") == organisation_id
+        ]
+        if not filtered_accounts:
+            await message.answer("У выбранной организации нет доступных счетов.")
             await state.clear()
             return
+
         account_map = {
             f"{a['accountName']} ({a['number'][-4:]})": a["id"]
-            for a in accounts
+            for a in filtered_accounts
         }
-        await state.update_data(accounts=account_map, accounts_full=accounts)
-        await message.answer("Выберите счёт:", reply_markup=get_account_keyboard(accounts))
+        await state.update_data(accounts=account_map, accounts_full=filtered_accounts)
+        await message.answer("Выберите счёт:", reply_markup=get_account_keyboard(filtered_accounts))
         await state.set_state(OperationForm.choosing_account)
     except Exception as e:
         await message.answer(f"❌ Ошибка загрузки счетов: {e}")
@@ -146,6 +155,7 @@ async def process_account_choice(message: Message, state: FSMContext):
     if account_id is None:
         await message.answer("Неверный выбор. Выберите счёт из списка.")
         return
+
     account_name = next(
         (a["accountName"] for a in user_data["accounts_full"] if a["id"] == account_id),
         account_key
@@ -188,19 +198,23 @@ async def confirm_operation(message: Message, state: FSMContext):
     if message.text not in ("✅ Да", "❌ Нет"):
         await message.answer("Пожалуйста, используйте кнопки для подтверждения.")
         return
+
     if message.text == "❌ Нет":
         await state.clear()
         await message.answer("Операция отменена.", reply_markup=get_main_menu())
         return
+
     data = await state.get_data()
     user_info = await get_user_info(message.from_user.id)
     if not user_info or not user_info.get("api_key"):
         await message.answer("❌ Ошибка: API-ключ не найден.", reply_markup=get_main_menu())
         await state.clear()
         return
+
     api = ReportFinanceAPI(api_key=user_info["api_key"])
     direction_id = data["direction_id"]
     operation_date = datetime.date.today()
+
     payment_data = {
         "externalId": str(uuid.uuid4()),
         "accountId": data["account_id"],
@@ -218,6 +232,7 @@ async def confirm_operation(message: Message, state: FSMContext):
     }
     if data.get("project_id") is not None:
         payment_data["projectId"] = data["project_id"]
+
     try:
         await api.create_payment(payment_data)
         await log_simple_operation(
